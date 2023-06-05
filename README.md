@@ -1,6 +1,6 @@
 # Amazon EBS Snapshot Tiering Evaluator
 
-This sample was written to enable evaulation of AWS spend associated with moving an Amazon EBS Snapshot from Amazon EBS Standard Tier to Amazon EBS Archive Tier storage. The main output of this utility is the estimated AWS cost assosciated with the target snapshot in both Standard and Archive tiers.
+This sample was written to enable "What If" cost analysis associated with moving an Amazon EBS Snapshot from Amazon EBS Standard Tier to Amazon EBS Archive Tier storage. The main output of this solution is the estimated AWS cost assosciated with the target snapshot in both Standard and Archive tiers.
 
 When you archive a snapshot, the incremental snapshot is converted to a full snapshot, and it is moved from the standard tier to the Amazon EBS Snapshots Archive tier (archive tier). Full snapshots include all of the blocks that were written to the volume at the time when the snapshot was created. The variance between incremental and full snapshots means effective up-front cost analysis can become an important factor to consider.
 
@@ -12,9 +12,9 @@ This code closely aligns with the steps for determining the reduction in standar
 
 - Pricing for Amazon EBS is based on GB-month.
 - This sample works on a 30-day month.
-- Snapshot storage within the Archive Tier currently charges a minimum of 90 days. As this utility compares pricing between EBS Standard Tier storage and the Archive Tier, we are using 3 months of storage (3x 30-day months) as our assumption and method of comparison.
-- **Please Note:** This script calls Amazon EBS direct APIs for Snapshots which do have costs associated with their usage. Under standard usage, the costs associated with tool is not expected to raise any concerns (`ListChangedBlocks` and `ListSnapshotBlocks` API calls = $0.0006 per thousand requests - _as of August 2022_). Please make sure to review your expected usage of this script and the EBS Pricing available at: https://aws.amazon.com/ebs/pricing/
-- This sample calls the AWS Pricing API in us-east-1 to dynamically source EBS snapshot storage pricing for the region.
+- Snapshot storage within the Archive Tier currently charges a minimum of 90 days. As this solution compares pricing between EBS Standard Tier storage and the Archive Tier, we are using 3 months of storage (3x 30-day months) as our assumption and method of comparison.
+- **Please Note:** This script calls Amazon EBS direct APIs for Snapshots which do have costs associated with their usage. Under standard usage, the costs associated with tool is not expected to raise any concerns (`ListChangedBlocks` and `ListSnapshotBlocks` API calls). Please make sure to review your expected usage of this script and the EBS Pricing available at: https://aws.amazon.com/ebs/pricing/
+- This sample calls the AWS Pricing API in us-east-1 to dynamically source Amazon EBS snapshot storage pricing for the region.
 
 ## Prerequisites
 
@@ -91,7 +91,7 @@ Estimated 90-day cost of snapshot in Archive Tier (USD): $4.12
 
 ## Quick Start (AWS CDK Method)
 
-This method will deploy an [AWS Step Functions](https://aws.amazon.com/step-functions/) State Machine to evaluate all EBS Snapshots within the region and AWS Account that it is deployed in. This project consists of a few Lambda Functions, the State Machine and an output S3 bucket.
+This method will deploy an [AWS Step Functions](https://aws.amazon.com/step-functions/) State Machine to evaluate all EBS Snapshots within the region and AWS Account that it is deployed in. This project consists of a few AWS Lambda Functions, the State Machine and an output Amazon S3 bucket.
 
 ### Build
 
