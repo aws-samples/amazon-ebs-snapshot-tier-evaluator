@@ -1,24 +1,32 @@
 """
-!! EBS Snapshot Tiering Evaluator !!
+EBS Snapshot Tiering Evaluator
 
-Purpose of this code is to help evaulate AWS spend associated with moving an EBS Snapshot 
-from EBS Standard Tier to EBS Archive Tier storage. This code closely aligns with the 
-steps for determining the reduction in standard tier storage costs outlined in the AWS 
-Documentation: 
+Purpose of this code is to analyse EBS snapshots and calculate AWS spend associated with
+moving an EBS Snapshot from EBS Standard Tier to EBS Archive Tier storage.
+
+This code closely aligns with the steps for determining the reduction in standard tier
+storage costs outlined in the AWS Documentation:
 
 https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/archiving-guidelines.html#archive-guidelines
+
+This is implemented as an AWS Lambda worker function that sits behind SQS and pulls "jobs"
+to evaluate. 
+
+Evaluation requires querying a rate limited API, so query results are cached in S3 once retrieved.
+
+To avoid multiple requests to the pricing API, this function expects to receive pricing data in the
+payload. This is sourced in the init stage of the overarching evaluation solution. 
 """
 
-import argparse
 import decimal
 import json
 import logging
 import os
-import re
-import sys
+import zlib
 from datetime import datetime
 from enum import Enum
 import boto3
+import botocore.exceptions
 
 
 class EvalScenario(Enum):
@@ -29,10 +37,17 @@ class EvalScenario(Enum):
     AFTER = 4
 
 
+class DecimalEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, decimal.Decimal):
+            if obj.is_zero():
+                return "0"
+            return str(obj)
+        return json.JSONEncoder.default(self, obj)
+
+
 # Setup logging
 logger = logging.getLogger()
-logger_handler = logging.StreamHandler(sys.stdout)
-logger.addHandler(logger_handler)
 for libname in ["boto3", "botocore", "urllib3"]:
     logging.getLogger(libname).setLevel(logging.WARNING)
 
@@ -41,89 +56,10 @@ aws_session = boto3.session.Session()
 current_aws_region = aws_session.region_name
 
 # Setup AWS Clients
+s3 = boto3.client('s3')
 ec2 = boto3.client('ec2')
 ebs = boto3.client('ebs')
-pricingapi = boto3.client('pricing', region_name='us-east-1')
-
-# AWS Pricing API Lookups
-
-
-def get_std_tier_snapshot_pricing():
-    """Function retrieves the price for EBS Standard Tier snapshot storage in the region."""
-    response = pricingapi.get_products(
-        ServiceCode='AmazonEC2',
-        Filters=[
-            {
-                "Type": "TERM_MATCH",
-                "Field": "productFamily",
-                "Value": "Storage Snapshot"
-            },
-            {
-                "Type": "TERM_MATCH",
-                "Field": "storageMedia",
-                "Value": "Amazon S3"
-            },
-            # {  # This filter works in us-east-1, but as we cannot do wildcards in the Filter here (api doesn't support) we need to filter returned products post this call.
-            #     "Type": "TERM_MATCH",
-            #     "Field": "usagetype",
-            #     "Value": "EBS:SnapshotUsage"
-            # },
-            {
-                "Type": "TERM_MATCH",
-                "Field": "regionCode",
-                "Value": current_aws_region
-            }
-        ],
-        FormatVersion='aws_v1',
-        MaxResults=50,
-    )
-
-    for item in response["PriceList"]:
-        price_dict = json.loads(item)
-        if re.search('.*EBS:SnapshotUsage$', price_dict["product"]["attributes"]["usagetype"]):
-            on_demand = price_dict["terms"]["OnDemand"]
-            on_demand_key = list(on_demand.values())[0]
-            price_dimension = on_demand_key["priceDimensions"]
-            price_dimension_key = list(price_dimension.values())[0]
-            price_description = price_dimension_key["description"]
-            price_per_unit = price_dimension_key["pricePerUnit"]["USD"]
-            print(f"Identified Standard Tier Pricing: {price_description}")
-            return decimal.Decimal(price_per_unit)
-
-    raise Exception(
-        'EBS Standard Storage Price not returned in Pricing API Response')
-
-
-def get_archive_tier_snapshot_pricing():
-    """Function retrieves the price for EBS Archive tier snapshot storage in the region."""
-    response = pricingapi.get_products(
-        ServiceCode='AmazonEC2',
-        Filters=[
-            {
-                "Type": "TERM_MATCH",
-                "Field": "snapshotarchivefeetype",
-                "Value": "SnapshotArchiveStorage"
-            },
-            {
-                "Type": "TERM_MATCH",
-                "Field": "regionCode",
-                "Value": current_aws_region
-            }
-        ],
-        FormatVersion='aws_v1',
-        MaxResults=50,
-    )
-
-    product_price = response["PriceList"][0]
-    price_dict = json.loads(product_price)
-    on_demand = price_dict["terms"]["OnDemand"]
-    on_demand_key = list(on_demand.values())[0]
-    price_dimension = on_demand_key["priceDimensions"]
-    price_dimension_key = list(price_dimension.values())[0]
-    price_description = price_dimension_key["description"]
-    price_per_unit = price_dimension_key["pricePerUnit"]["USD"]
-    print(f"Identified Archive Tier Pricing: {price_description}")
-    return decimal.Decimal(price_per_unit)
+dynamodb = boto3.client('dynamodb')
 
 
 def get_snapshot_blocks(snapshot: str):
@@ -149,9 +85,9 @@ def get_snapshot_blocks(snapshot: str):
 def get_max_block_index(blocks):
     """Function to get the max BlockIndex for the snapshot"""
     max_block_index = int()
-    for b in blocks:
-        if b["BlockIndex"] > max_block_index:
-            max_block_index = b["BlockIndex"]
+    for block in blocks:
+        if block["BlockIndex"] > max_block_index:
+            max_block_index = block["BlockIndex"]
     return max_block_index
 
 
@@ -270,47 +206,119 @@ def determine_eval_scenario(snapshot_before, snapshot_after):
             "Encountered an evaluation scenario which isn't currently catered for.")
 
 
+def compress_json(data):
+    """Function to compress the json string"""
+    return zlib.compress(json.dumps(data).encode("utf-8"))
+
+
+def decompress_json(data):
+    """Function to decompress the json string"""
+    return json.loads(zlib.decompress(data).decode("utf-8"))
+
+
+def get_cached_changed_blocks(snap1: str, snap2: str):
+    """Function to get the cached changed blocks from the cache"""
+    logger.info(
+        f"Checking Cache for changed blocks between {snap1} and {snap2}")
+    s3_bucket = os.environ['S3_BUCKET_NAME']
+    s3_base_path = 'cache/'
+    cache_key = f"{snap1}_{snap2}.json.zlib"
+    try:
+        # if file exists in S3
+        s3_object = s3.get_object(
+            Bucket=s3_bucket, Key=s3_base_path + cache_key)
+        logger.info('Cache Hit')
+        result = decompress_json(s3_object['Body'].read())
+        # Cache only stores the list of blocks, not the expected json structure.
+        return {
+            "ChangedBlocks": result
+        }
+    except s3.exceptions.NoSuchKey:
+        logger.info('Cache Miss')
+        return False
+    except Exception as error:
+        logger.warning("We hit an error exception during cache check")
+        logger.warning(error)
+        return False
+
+
+def store_cached_changed_blocks(snap1: str, snap2: str, changed_blocks: list):
+    """Function to store the changed blocks in the cache"""
+    logger.info(f"Storing changed blocks between {snap1} and {snap2} in cache")
+    cache_key = f"{snap1}_{snap2}.json.zlib"
+    s3_bucket = os.environ['S3_BUCKET_NAME']
+    s3_base_path = 'cache/'
+    # upload json dump of changed_blocks to file in s3 using cache_key
+    s3.put_object(
+        Bucket=s3_bucket,
+        Key=s3_base_path + cache_key,
+        Body=compress_json(changed_blocks)
+    )
+
+    logger.info(f"Stored changed blocks between {snap1} and {snap2} in cache.")
+
+
 def get_changed_blocks(snap1: str, snap2: str):
     """Function calles the list_changed_blocks API and returns the response"""
-    try:
-        ebs_response = ebs.list_changed_blocks(
-            FirstSnapshotId=snap1,
-            SecondSnapshotId=snap2,
-        )
-        blocks = ebs_response['ChangedBlocks']
-        while "NextToken" in ebs_response:
+
+    cached_result = get_cached_changed_blocks(snap1, snap2)
+    if cached_result:
+        return cached_result
+    else:
+        # Grab data from the API
+        try:
             ebs_response = ebs.list_changed_blocks(
                 FirstSnapshotId=snap1,
                 SecondSnapshotId=snap2,
-                NextToken=ebs_response["NextToken"])
-            blocks.extend(ebs_response["ChangedBlocks"])
-        # overwrite with complete array (in case of pagination)
-        ebs_response["ChangedBlocks"] = blocks
-        return ebs_response
-    except ebs.exceptions.ValidationException as error:
-        logger.warning(
-            f"WARN - We hit a validation exception - {error.response['Error']['Message']}")
-        if "is empty" in error.response['Error']['Message']:
-            # Let's handle the empty snapshot edge case and craft an no changed blocks api response and return it.
-            no_changed_blocks_response = {
-                'ChangedBlocks': [],
-                'ExpiryTime': datetime(2022, 1, 1),
-                'VolumeSize': 123,
-                'BlockSize': 123,
-            }
-            return no_changed_blocks_response
-        raise
-    except ebs.exceptions.ResourceNotFoundException as error:
-        logger.error(
-            'It seems like we were not able to find this snapshot. It is likely not in a completed state. Please try again!')
-        raise error
+            )
+            blocks = ebs_response['ChangedBlocks']
+            while "NextToken" in ebs_response:
+                ebs_response = ebs.list_changed_blocks(
+                    FirstSnapshotId=snap1,
+                    SecondSnapshotId=snap2,
+                    NextToken=ebs_response["NextToken"])
+                blocks.extend(ebs_response["ChangedBlocks"])
+            # overwrite with complete array (in case of pagination)
+            ebs_response["ChangedBlocks"] = blocks
+
+            # strip response of fields (tokens) we don't need
+            for block in ebs_response["ChangedBlocks"]:
+                if "FirstBlockToken" in block:
+                    del block["FirstBlockToken"]
+                if "SecondBlockToken" in block:
+                    del block["SecondBlockToken"]
+            # store the result in the cache
+            store_cached_changed_blocks(
+                snap1, snap2, changed_blocks=ebs_response["ChangedBlocks"])
+            return ebs_response
+        except ebs.exceptions.ValidationException as error:
+            logger.warning(
+                f"WARN - We hit a validation exception - {error.response['Error']['Message']}")
+            if "is empty" in error.response['Error']['Message']:
+                # Let's handle the empty snapshot edge case
+                # Crafting a "no changed blocks" api response to return
+                no_changed_blocks_response = {
+                    'ChangedBlocks': [],
+                    'ExpiryTime': datetime(2022, 1, 1),
+                    'VolumeSize': 123,
+                    'BlockSize': 123,
+                }
+                return no_changed_blocks_response
+            raise
+        except ebs.exceptions.ResourceNotFoundException as error:
+            # This is an edge case that could be hit
+            # Depends on initial EBS Snapshot filtering or live env changes
+            logger.error(
+                'It seems like we were not able to find this snapshot. It is likely not in a completed state. Please try again!')
+            raise error
 
 
-def main(target_snapshot: str, ebs, ec2):
+def main(target_snapshot: str, pricing: dict):
     """This function contains the main script logic flow"""
-    print("Looking up region specific EBS snapshot pricing")
-    EBS_STD_SNAPSHOT_PRICE_GB_MONTH = get_std_tier_snapshot_pricing()
-    EBS_ARCHIVE_SNAPSHOT_PRICE_GB_MONTH = get_archive_tier_snapshot_pricing()
+
+    # Expects EBS pricing to be supplied from upstream/calling function
+    EBS_STD_SNAPSHOT_PRICE_GB_MONTH = pricing['std_tier_snapshot_pricing']
+    EBS_ARCHIVE_SNAPSHOT_PRICE_GB_MONTH = pricing['archive_tier_snapshot_pricing']
 
     logger.info(
         f"Starting Evaluation of target Snaphot Id: {target_snapshot}")
@@ -388,7 +396,7 @@ def main(target_snapshot: str, ebs, ec2):
     if current_eval_scenario == EvalScenario.NEITHER:
         # We already have the block information gathered for this scenario (just the one snapshot)
         approx_size_target_snapshot_bytes = approx_full_snapshot_size_bytes
-        eval_data["approx_size_target_snapshot_bytes"] = approx_full_snapshot_size_bytes
+        eval_data["approx_size_target_snapshot_bytes"] = approx_size_target_snapshot_bytes
 
     if current_eval_scenario == EvalScenario.BOTH:
 
@@ -405,22 +413,26 @@ def main(target_snapshot: str, ebs, ec2):
 
         logger.info(
             'Step 7 - Comparing block indexes to identify unreferenced data in target snapshot...')
-        # Making a quick list of all blocks found in the before-to-target changed blocks comparison
+
+        # Making a list of all blocks found in the before-to-target changed blocks comparison
         seen_changed_block_index_before = []
         for b in changed_blocks_before["ChangedBlocks"]:
             seen_changed_block_index_before.append(b["BlockIndex"])
 
-        # Now we loop the target-to-after results and look for duplicates in seen_changed_block_index_before
-        block_indexes_in_both_comparisons = []
+        # Making a list of all blocks found in the target-to-after changed blocks comparison
+        seen_changed_block_index_after = []
         for b in changed_blocks_after["ChangedBlocks"]:
-            if b["BlockIndex"] in seen_changed_block_index_before:
-                block_indexes_in_both_comparisons.append(b["BlockIndex"])
+            seen_changed_block_index_after.append(b["BlockIndex"])
+
+        # Using set intersection to find the blocks that are in both comparisons.
+        block_indexes_in_both_comparisons = set(seen_changed_block_index_before).intersection(
+            set(seen_changed_block_index_after))
 
         # Calculate the amount of space that would be saved by moving this snapshot to archive tier
         approx_size_target_snapshot_bytes = len(
             block_indexes_in_both_comparisons) * snapshot_blocks['BlockSize']
 
-        eval_data["approx_size_target_snapshot_bytes"] = approx_full_snapshot_size_bytes
+        eval_data["approx_size_target_snapshot_bytes"] = approx_size_target_snapshot_bytes
 
     if current_eval_scenario == EvalScenario.BEFORE:
         # BEFORE - only the before snapshot exists, none after (i.e. target is most likely the most recent snapshot) - target snap includes 1 set of changed blocks
@@ -435,7 +447,7 @@ def main(target_snapshot: str, ebs, ec2):
         approx_size_target_snapshot_bytes = len(
             changed_blocks_before["ChangedBlocks"]) * snapshot_blocks['BlockSize']
 
-        eval_data["approx_size_target_snapshot_bytes"] = approx_full_snapshot_size_bytes
+        eval_data["approx_size_target_snapshot_bytes"] = approx_size_target_snapshot_bytes
 
     if current_eval_scenario == EvalScenario.AFTER:
         # No prior snapshots = target snapshot does not reference blocks. Has everything.
@@ -452,7 +464,7 @@ def main(target_snapshot: str, ebs, ec2):
         approx_size_target_snapshot_bytes = len(
             changed_blocks_after["ChangedBlocks"]) * snapshot_blocks['BlockSize']
 
-        eval_data["approx_size_target_snapshot_bytes"] = approx_full_snapshot_size_bytes
+        eval_data["approx_size_target_snapshot_bytes"] = approx_size_target_snapshot_bytes
 
     logger.info('Step 8 - Determining storage costs for this snapshot...')
 
@@ -474,38 +486,35 @@ def main(target_snapshot: str, ebs, ec2):
     return eval_data
 
 
-def display_cli_summary_report(eval_results: dict):
-    """Displays the results summary for CLI invocations"""
-    # Display Summary Report
-    print('')
-    logger.info("===== Snapshot Evaulation Report =====")
-    logger.info(f"Target Snapshot Id: {eval_results['target_snapshot']}")
-    logger.info(
-        f"Source EBS Volume ID: {eval_results['snapshot_source_volume_id']}")
-    logger.info(
-        f"EBS Volume Size: {eval_results['source_ebs_volume_size_gb']} GB")
+def convert_pricing_data_to_decimal(payload: dict):
+    """Converts the pricing data to a decimal"""
+    payload['pricing_data']['std_tier_snapshot_pricing'] = decimal.Decimal(
+        payload['pricing_data']['std_tier_snapshot_pricing'])
+    payload['pricing_data']['archive_tier_snapshot_pricing'] = decimal.Decimal(
+        payload['pricing_data']['archive_tier_snapshot_pricing'])
+    return payload
 
-    # first try to display as GB (if enough blocks)
-    if bytes_to_gb(eval_results['approx_size_target_snapshot_bytes']) > 1:
-        logger.info(
-            f"Approx. size of target snapshot: {bytes_to_gb(eval_results['approx_size_target_snapshot_bytes'])} GB")
-    # next display as MB
-    elif bytes_to_mb(eval_results['approx_size_target_snapshot_bytes']) > 1:
-        logger.info(
-            f"Approx. size of target snapshot: {bytes_to_mb(eval_results['approx_size_target_snapshot_bytes'])} MB")
-    else:  # display as bytes
-        logger.info(
-            f"Approx. size of target snapshot: {eval_results['approx_size_target_snapshot_bytes']} bytes")
 
+def update_ddb_table(jobid: str, snapshot_id: str, data: dict):
+    """Updates the DynamoDB Eval Results Table with the results"""
     logger.info(
-        f"Approx. size of full snapshot (if moved to Archive Tier): {round(bytes_to_gb(eval_results['approx_full_snapshot_size_bytes']))} GB")
-
-    print('')
-    logger.info(
-        f"Estimated 90-day cost of snapshot in Standard Tier (USD): ${round(eval_results['cost_estimate_target_snapshot_in_std_tier'], 2)}")
-    logger.info(
-        f"Estimated 90-day cost of snapshot in Archive Tier (USD): ${round(eval_results['cost_estimate_target_snapshot_in_archive_tier'], 2)}")
-    logger.info("===== End Evaulation Report =====")
+        f"Updating Status of snapshot ({snapshot_id}) in job ({jobid})")
+    try:
+        dynamodb.update_item(
+            TableName=os.environ.get('DDB_EVAL_RESULTS'),
+            Key={'JobId': {'S': jobid},
+                 'SnapshotId': {'S': snapshot_id}},
+            UpdateExpression="SET #data = :data , completed = :completed",
+            ExpressionAttributeNames={'#data': 'data'},
+            ExpressionAttributeValues={
+                ':data': {'S': json.dumps(data, cls=DecimalEncoder)},
+                ':completed': {'S': 'true'}
+            }
+        )
+    except botocore.exceptions.ClientError as e:
+        logger.error(
+            f"Error updating DynamoDB Item: {e.response['Error']['Message']}")
+        raise
 
 
 def lambda_handler(event, context):
@@ -517,46 +526,22 @@ def lambda_handler(event, context):
         logger.setLevel(logging.INFO)
 
     # Perform main business logic
-    data = main(target_snapshot=event['target_snapshot'], ebs=ebs, ec2=ec2)
-    return data
-
-
-if __name__ == "__main__":
-    """Handles direct python invocations - CLI Script Mode"""
-    # Setup command line args / help
-    parser = argparse.ArgumentParser()
-    parser.add_argument('-p', '--profile', dest='profile',
-                        type=str, help='AWS Named Profile')
-    parser.add_argument('-r', '--region', dest='region',
-                        type=str, help='AWS Region (e.g. "us-east-1")')
-    parser.add_argument('-s', '--snapshot', dest='target_snapshot', type=str, required=True,
-                        help='Target Snapshot ID for Evaluation')
-    parser.add_argument('-v', '--verbose', dest='verbose', action="store_true",
-                        help='(Optional) Display verbose logging (default: false)')
-    args = parser.parse_args()
-
-    # Logger Config
-    if args.verbose:
-        logger.setLevel(logging.DEBUG)
-    else:
-        logger.setLevel(logging.INFO)
-
-    # Setup AWS Session
-    session_args = {}
-    if args.profile is not None:
-        session_args['profile_name'] = args.profile
-        logger.info(f"AWS Profile: {args.profile}")
-    if args.region is not None:
-        session_args['region_name'] = args.region
-        logger.info(f"Target Region: {args.region}")
-    session = boto3.Session(**session_args)
-
-    # Setup AWS Clients
-    ec2 = session.client('ec2')
-    ebs = session.client('ebs')
-
-    # Perform main business logic
-    data = main(target_snapshot=args.target_snapshot, ebs=ebs, ec2=ec2)
-
-    # Display the CLI summary report
-    display_cli_summary_report(eval_results=data)
+    for record in event['Records']:
+        # payload example
+        # {
+        #     "jobid": jobid,
+        #     "snapshot_id": snapshot_id,
+        #     "ddb_item_id": f"{jobid}-{snapshot_id}",
+        #     "pricing_data": {
+        #          'std_tier_snapshot_pricing': std_tier_snapshot_pricing,
+        #          'archive_tier_snapshot_pricing': archive_tier_snapshot_pricing
+        #      }
+        # }
+        payload = json.loads(record['body'])
+        payload = convert_pricing_data_to_decimal(payload)
+        data = main(target_snapshot=payload['snapshot_id'],
+                    pricing=payload['pricing_data'])
+        update_ddb_table(
+            jobid=payload['jobid'], snapshot_id=payload['snapshot_id'], data=data)
+        logger.info("Snapshot Evaluation Complete")
+        return True

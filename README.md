@@ -14,6 +14,7 @@ This code closely aligns with the steps for determining the reduction in standar
 - This sample works on a 30-day month.
 - Snapshot storage within the Archive Tier currently charges a minimum of 90 days. As this solution compares pricing between EBS Standard Tier storage and the Archive Tier, we are using 3 months of storage (3x 30-day months) as our assumption and method of comparison.
 - **Please Note:** This script calls Amazon EBS direct APIs for Snapshots which do have costs associated with their usage. Under standard usage, the costs associated with tool is not expected to raise any concerns (`ListChangedBlocks` and `ListSnapshotBlocks` API calls). Please make sure to review your expected usage of this script and the EBS Pricing available at: https://aws.amazon.com/ebs/pricing/
+- The `ListChangedBlocks` API is called for evaluation of snapshot blocks and is rate limited. This solution leverages a queue and worker process to work within these API constraints.
 - This sample calls the AWS Pricing API in us-east-1 to dynamically source Amazon EBS snapshot storage pricing for the region.
 
 ## Prerequisites
@@ -21,77 +22,13 @@ This code closely aligns with the steps for determining the reduction in standar
 - Python 3.9+
 - AWS Account Credentials
 - [AWS Cloud Development Kit (CDK)](https://aws.amazon.com/cdk/)
+- Bootstrapped AWS Account (per https://docs.aws.amazon.com/cdk/v2/guide/bootstrapping.html)
 - Node.js 18.16.0+
 
-## Quick Start (CLI Method)
+## Get Started (AWS CDK)
 
-**This Quick Start is best for one-off EBS snapshot evaluations.** This method can quickly become cumbersome for evaluation of many EBS Snapshots. For wide-scale evaluations, use the _Quick Start (AWS CDK Method)_.
-
-_Assuming OSX/Linux - Adjust commands below to suit windows env (e.g. venv activation)_
-
-- Clone this repo and enter directory.
-- Setup Python Virtual Environment: `python3 -m venv venv`
-- Activate the Virtual Environment: `. venv/bin/activate`
-- Install the python requirements: `python -m pip install -r requirements.txt`
-- Run the script: `python src/snapshot-evaluator.py --snapshot snap-xxxxx`
-
-```text
-$ python src/snapshot_evaluator.py -h
-usage: snapshot_evaluator.py [-h] [-p PROFILE] [-r REGION] -s TARGET_SNAPSHOT [-v]
-
-optional arguments:
-  -h, --help            show this help message and exit
-  -p PROFILE, --profile PROFILE
-                        AWS Named Profile
-  -r REGION, --region REGION
-                        AWS Region (e.g. "us-east-1")
-  -s TARGET_SNAPSHOT, --snapshot TARGET_SNAPSHOT
-                        Target Snapshot ID for Evaluation
-  -v, --verbose         (Optional) Display verbose logging (default: false)
-```
-
-### Sample CLI Run
-
-Below is an example output from the tool (anonymized).
-
-```
-$ python src/snapshot_evaluator.py -s snap-22222222222222222
- ===== Starting Evaluation of target Snaphot Id: snap-22222222222222222 =====
-Looking up region specific EBS snapshot pricing
-Identified Standard Tier Pricing: $0.055 per GB-Month of snapshot data stored - Asia Pacific (Sydney)
-Identified Archive Tier Pricing: $0.01375 per GB-Month of snapshot archive data stored - Asia Pacific (Sydney)
-Step 1 - Determining the full size of the EBS snapshot...
-Step 2 - Identifying the source EBS volume from the EBS snapshot...
-Step 3 - Finding all snapshots of the source EBS volume...
-Step 4 - Sorting the snapshots by created date...
-Step 5 - Identifying any prior/following (surrounding) snapshots...
-Step 5a - Snapshot Before Target Snapshot: snap-11111111111111111
-Step 5a - Snapshot After Target Snapshot: snap-33333333333333333
-Step 6 - Finding any unreferenced blocks in the target snapshot...
-Step 6a - Identifying the current snapshot scenario...
-Step 6a - Current Scenario: Both before and after snapshots to consider.
-Step 6b - Getting changed blocks between previous and target snapshots...
-Step 6b - Getting changed blocks between target snapshot and subsequent snapshot...
-Step 7 - Comparing block indexes to identify unreferenced data in target snapshot...
-Step 8 - Determining storage costs for this snapshot...
-Step 8a - Determining storage costs - Standard tier...
-Step 8b - Determining storage costs - Archive tier...
- ===== Evaluation Complete =====
-
- ===== Summary Report =====
-Target Snapshot Id: snap-22222222222222222
-Source EBS Volume ID: vol-0f419475aaaaaaaaa
-EBS Volume Size: 100 GB
-Approx. size of target snapshot: 10.447265625 GB
-Approx. size of full snapshot (if moved to Archive Tier): 100 GB
-
-Estimated 90-day cost of snapshot in Standard Tier (USD): $1.72
-Estimated 90-day cost of snapshot in Archive Tier (USD): $4.12
-```
-
-## Quick Start (AWS CDK Method)
-
-This method will deploy an [AWS Step Functions](https://aws.amazon.com/step-functions/) State Machine to evaluate all EBS Snapshots within the region and AWS Account that it is deployed in. This project consists of a few AWS Lambda Functions, the State Machine and an output Amazon S3 bucket.
+Use the following steps to deploy this sample solution into your AWS environment.
+The following steps expect that your AWS target environment & associated credentials have been setup for deployment into your desired AWS Account & region.
 
 ### Build
 
@@ -105,15 +42,15 @@ $ npm run build
 
 ### Deploy
 
-_Assuming you have your local environment setup with AWS Credentials:_
+_Assuming your local environment setup with AWS Credentials, targetting bootstrapped account/region._
 
-Run `cdk deploy`. This will deploy / redeploy your Stack to your AWS Account.
+Run `cdk deploy`. This will deploy / redeploy the EBS Snapshot Evaluator solution to your AWS Account.
 
 ### Execute
 
 In the AWS Management Console, navigate to the [AWS Step Functions](https://console.aws.amazon.com/states/home) page and select the State Machine you deployed.
 
-_It should be named similar to the following: `SnapshotEvalStateMachine2AC33273-aaaOrPWres5H`_
+_Your exact State Machine is identified in the CloudFormation Stack Outputs. It should be named similar to the following: `SnapshotEvalStateMachine2AC33273-aaaOrPWres5H`_
 
 **Start the Execution** of the state machine. State Machine input is not required (to accept defaults). If you would like to filter your snapshots for evaluation, see details below.
 
@@ -122,12 +59,12 @@ _It should be named similar to the following: `SnapshotEvalStateMachine2AC33273-
 This state machine performs a scale-out function to facilitate quick evaluation of EBS Snapshots within the deployed account/region.
 
 <kbd>
-<img src="./assets/StateMachine.png" width="200px" margin="auto" />
+<img src="./assets/architecture.jpg" width="500px" margin="auto" />
 </kbd>
 
-#### Step 1 - Get Snapshots
+#### Step 1 - Init Function
 
-The **Get Snapshots** task will query the API and generate a list of EBS Snapshots to process.
+The **Init Function** establishes a new job run, obtains the relevant AWS pricing from the AWS Pricing API and also generates a list of EBS Snapshots in scope for this evaluation job.
 
 Be default, this sample will filter for all EBS snapshots which meet the criteria:
 
@@ -136,9 +73,11 @@ Be default, this sample will filter for all EBS snapshots which meet the criteri
 - Same Account and Region as the Lambda Function
 - Owned by the current account
 
+All in scope snapshots are registered in the DynamoDB tables, and submitted to the solution's SQS queue for subsequent processing.
+
 ##### Custom EBS Snapshot Filter
 
-You can optionally supply your own EBS Snapshot filter during invocation of the State Machine to more selectively target certain snapshots.
+You can optionally supply an Amazon EBS Snapshot filter to more selectively target certain snapshots. This section outlines the syntax and expected input that should be supplied in the State Machine Execution Input.
 Ensure you encapsulate your custom array of filters in the `snapshot_filter` key. All other key names are ignored for this step.
 
 Supply filters based upon the boto3 format detailed here: https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/ec2.html#EC2.Client.describe_snapshots
@@ -168,17 +107,34 @@ The following JSON example provides a starting point for building your custom sn
 }
 ```
 
-#### Step 2 - Iterate and Evaluate
+#### Step 2 - Processing Wait Loop
 
-For each snapshot returned we map a single snapshot per **Evaluate Snapshots** Lambda invocation.
+While processing is underway (outside the scope of the State Machine) the state machine now enters into a wait loop. By default the state machine checks progress every minute.
 
-**Note** The **Default Max Concurrency** of the state machine is set to `20`. This default limit is in place to restrict potential impacts to [AWS Lambda concurrency limits](https://docs.aws.amazon.com/lambda/latest/dg/lambda-concurrency.html).
+You can track progress of the snapshot evaluation processing through a few mechanisms:
 
-You can adjust this settin as required by manually editing the deployed State Machine or updating the `_CONCURRENT_SNAPSHOT_EVALUATIONS` constant in the CDK definition (`index.ts`). If you update the CDK definition file, you will need to redeploy the CDK solution (`cdk deploy`)).
+- The `CheckProcessingStatus` function provides a `num_jobs_pending` metric in its output you can monitor.
+- Alternatively, you could watch the SQS Queue depth for any pending jobs.
+- Alternatively, you could query the solution's `SnapshotEvalJobs` DynamoDB table which contains the status of all jobs.
+
+The duration this solution stay in this processing wait loop depends on the number of snapshots in scope and the size (number of blocks changed).
+
+##### Out of Band Processing
+
+A Lambda Worker process is seutp behind the SQS Queue (concurrency limited) to process each of the in scope jobs.
+
+This worker will:
+
+- Pull job from SQS
+- Query the EBS Direct APIs (+ cache)
+- Evaluate the snapshot
+- Emit results into Amazon DynamoDB tracking table
 
 #### Step 3 - Output Results
 
-For ease of use, we collate all the results and push these to a CSV file in S3. Download this file for your analysis.
+Once all processing jobs have reported complete, we move onto the output results stage.
+
+This Lambda function pulls and collate all the job results into a CSV file. This CSV file is pushed into the Snapshot Eval Bucket in Amazon S3. Download this file for your analysis. Of most note is the final few columns (which compare 90-day cost associated with each snapshot in either tier).
 
 **NB** For ease of use, the output step within the step function includes the specific path that the CSV is uploaded to in S3.
 
