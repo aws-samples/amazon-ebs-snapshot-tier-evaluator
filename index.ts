@@ -70,7 +70,6 @@ export class EBSSnapshotEvalStack extends cdk.Stack {
       {
         visibilityTimeout: cdk.Duration.seconds(900),
         receiveMessageWaitTime: cdk.Duration.seconds(5),
-        removalPolicy: cdk.RemovalPolicy.RETAIN,
         queueName: "SnapshotEvalJobQueue",
       }
     );
