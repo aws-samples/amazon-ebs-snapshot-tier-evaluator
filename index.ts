@@ -82,7 +82,7 @@ export class EBSSnapshotEvalStack extends cdk.Stack {
       handler: "index.lambda_handler",
       functionName: "SnapshotsJobInit",
       timeout: cdk.Duration.seconds(300),
-      memorySize: 256,
+      memorySize: 1024,
       runtime: lambda.Runtime.PYTHON_3_11,
       logRetention: cdk.aws_logs.RetentionDays.ONE_MONTH,
       environment: {
