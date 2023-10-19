@@ -77,6 +77,17 @@ def get_snapshot_blocks(snapshot: str):
         # overwrite with complete array (in case of pagination)
         ebs_response["Blocks"] = blocks
         return ebs_response
+    # handle the ResourceNotFoundException from the list_snapshot_blocks api call
+    except botocore.exceptions.ClientError as e:
+        if e.response['Error']['Code'] == 'ResourceNotFoundException':
+            print(
+                "Hit a ResourceNotFoundException exception. Possible that the EBS Snapshot no longer exists.")
+            print(e)
+            return None
+        else:
+            print("Error encountered whilst listing snapshot blocks")
+            print(e)
+            raise
     except:
         print("Error encountered whilst listing snapshot blocks")
         raise
@@ -111,13 +122,18 @@ def bytes_to_gb(size_in_bytes: int):
 
 def get_source_volume_id(snapshot_id: str):
     """Function to get the volume id from the snashot id"""
-    ec2_response = ec2.describe_snapshots(
-        SnapshotIds=[
-            snapshot_id,
-        ],
-    )
-    volume_id = ec2_response["Snapshots"][0]["VolumeId"]
-    return volume_id
+    try:
+        ec2_response = ec2.describe_snapshots(
+            SnapshotIds=[
+                snapshot_id,
+            ],
+        )
+        volume_id = ec2_response["Snapshots"][0]["VolumeId"]
+        return volume_id
+    except ec2.exceptions.ClientError as e:
+        print("Error encountered whilst getting volume id from snapshot id")
+        print(e)
+        return None
 
 
 def get_volume_snapshots(ebs_volume_id: str):
@@ -309,8 +325,8 @@ def get_changed_blocks(snap1: str, snap2: str):
             # This is an edge case that could be hit
             # Depends on initial EBS Snapshot filtering or live env changes
             logger.error(
-                'It seems like we were not able to find this snapshot. It is likely not in a completed state. Please try again!')
-            raise error
+                'ERROR. We were not able to find this snapshot whilst assessing blocks. It is likely not in a completed state (perhaps deleted). Please try again!')
+            return None
 
 
 def main(target_snapshot: str, pricing: dict):
@@ -329,6 +345,15 @@ def main(target_snapshot: str, pricing: dict):
     # Step 1 - Determine Full Snapshot Size
     logger.info("Step 1 - Determining the full size of the EBS snapshot...")
     snapshot_blocks = get_snapshot_blocks(target_snapshot)
+
+    if snapshot_blocks is None:
+        error_msg = f"Unable to find snapshot blocks for snapshot: {target_snapshot}"
+        logger.error(error_msg)
+        eval_data[
+            "error_message"] = error_msg
+        eval_data["error_code"] = "SNAPSHOT_BLOCKS_NOT_FOUND"
+        return eval_data
+
     eval_data["source_ebs_volume_size_gb"] = snapshot_blocks['VolumeSize']
     snapshot_block_size_bytes = snapshot_blocks['BlockSize']
     eval_data["snapshot_block_size_bytes"] = snapshot_block_size_bytes
@@ -344,6 +369,14 @@ def main(target_snapshot: str, pricing: dict):
         "Step 2 - Identifying the source EBS volume from the EBS snapshot...")
     snapshot_source_volume_id = get_source_volume_id(
         snapshot_id=target_snapshot)
+
+    if snapshot_source_volume_id is None:
+        error_msg = f"Error identifying the source volume for snapshot: {target_snapshot}"
+        logger.error(error_msg)
+        eval_data["error_message"] = error_msg
+        eval_data["error_code"] = "SOURCE_VOLUME_NOT_FOUND"
+        return eval_data
+
     eval_data["snapshot_source_volume_id"] = snapshot_source_volume_id
 
     # Step 3 - Find all of the snapshots created from the source volume
@@ -405,11 +438,23 @@ def main(target_snapshot: str, pricing: dict):
         # We check the blocks changed for both (before>target and target>after) snapshot references.
         changed_blocks_before = get_changed_blocks(
             snap1=snapshot_before["SnapshotId"], snap2=target_snapshot)
+        if changed_blocks_before is None:
+            error_msg = f"Unable to find snapshot during changed block analysis: {target_snapshot}"
+            logger.error(error_msg)
+            eval_data["error_message"] = error_msg
+            eval_data["error_code"] = "SNAPSHOT_NOT_FOUND"
+            return eval_data
 
         logger.info(
             'Step 6b - Getting changed blocks between target snapshot and subsequent snapshot...')
         changed_blocks_after = get_changed_blocks(
             snap1=target_snapshot, snap2=snapshot_after["SnapshotId"])
+        if changed_blocks_after is None:
+            error_msg = f"Unable to find snapshot during changed block analysis: {target_snapshot}"
+            logger.error(error_msg)
+            eval_data["error_message"] = error_msg
+            eval_data["error_code"] = "SNAPSHOT_NOT_FOUND"
+            return eval_data
 
         logger.info(
             'Step 7 - Comparing block indexes to identify unreferenced data in target snapshot...')
@@ -440,6 +485,12 @@ def main(target_snapshot: str, pricing: dict):
             'Step 6b - Getting changed blocks between previous and target snapshots...')
         changed_blocks_before = get_changed_blocks(
             snap1=snapshot_before["SnapshotId"], snap2=target_snapshot)
+        if changed_blocks_before is None:
+            error_msg = f"Unable to find snapshot during changed block analysis: {target_snapshot}"
+            logger.error(error_msg)
+            eval_data["error_message"] = error_msg
+            eval_data["error_code"] = "SNAPSHOT_NOT_FOUND"
+            return eval_data
 
         logger.info(
             'Step 7 - Changed block delta contains the unreferenced (changed) data in target snapshot...')
@@ -456,6 +507,12 @@ def main(target_snapshot: str, pricing: dict):
             'Step 6b - Getting changed blocks between target snapshot and subsequent snapshot...')
         changed_blocks_after = get_changed_blocks(
             snap1=target_snapshot, snap2=snapshot_after["SnapshotId"])
+        if changed_blocks_after is None:
+            error_msg = f"Unable to find snapshot during changed block analysis: {target_snapshot}"
+            logger.error(error_msg)
+            eval_data["error_message"] = error_msg
+            eval_data["error_code"] = "SNAPSHOT_NOT_FOUND"
+            return eval_data
 
         logger.info(
             'Step 7 - Changed block delta contains amount of blocks that would be no longer referenced in target snapshot...')
