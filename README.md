@@ -59,9 +59,9 @@ The following steps expect that your AWS target environment & associated credent
 To build this app, you need to be in this sample's root folder. Then run the following:
 
 ```bash
-$ npm install -g aws-cdk
-$ npm install
-$ npm run build
+npm install -g aws-cdk
+npm install
+npm run build
 ```
 
 ### Deploy
@@ -190,6 +190,7 @@ The CSV file contains an unfiltered view of all metadata collected for each snap
 | `snapshot_before`                                      | [Backup Chain] The EBS snapshot id of a snapshot immediately before (prior) the target snapshot. This value may be null if no prior snapshots exist.    |
 | `snapshot_after`                                       | [Backup Chain] The EBS snapshot id of a snapshot immediately after (post) the target snapshot. This value may be null if no subsequent snapshots exist. |
 | `approx_size_target_snapshot_bytes`                    | This column contains the approximate size of the target snapshot (in bytes). Key to understanding what costs within the Standard Tier.                  |
+| `approx_size_target_snapshot_removed_bytes`            | This column contanis the approximate amount of bytes that would be removed if the snapshot is removed from the standard tier (e.g. archived or deleted) |
 | `cost_estimate_90days_target_snapshot_in_std_tier`     | :star: [Cost Estimate] This column contains the estimated 90 day cost for having the target snapshot in the **STANDARD tier.**                          |
 | `cost_estimate_90days_target_snapshot_in_archive_tier` | :star: [Cost Estimate] This column contains the estimated 90 day cost for having the target snapshot in the **ARCHIVE tier.**                           |
 
@@ -200,3 +201,5 @@ See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for more inform
 ## License
 
 This library is licensed under the MIT-0 License. See the LICENSE file.
+
+## Troubleshooting
