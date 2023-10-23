@@ -93,15 +93,6 @@ def get_snapshot_blocks(snapshot: str):
         raise
 
 
-def get_max_block_index(blocks):
-    """Function to get the max BlockIndex for the snapshot"""
-    max_block_index = int()
-    for block in blocks:
-        if block["BlockIndex"] > max_block_index:
-            max_block_index = block["BlockIndex"]
-    return max_block_index
-
-
 def calculate_approx_full_snapshot_size(number_of_blocks: int,
                                         block_size_bytes: int):
     """Function to calculate the approximate size of the full snapshot"""
@@ -357,9 +348,9 @@ def main(target_snapshot: str, pricing: dict):
     eval_data["source_ebs_volume_size_gb"] = snapshot_blocks['VolumeSize']
     snapshot_block_size_bytes = snapshot_blocks['BlockSize']
     eval_data["snapshot_block_size_bytes"] = snapshot_block_size_bytes
-    max_block_index = get_max_block_index(snapshot_blocks["Blocks"])
+    number_of_blocks = len(snapshot_blocks["Blocks"])
     approx_full_snapshot_size_bytes = calculate_approx_full_snapshot_size(
-        number_of_blocks=max_block_index,
+        number_of_blocks=number_of_blocks,
         block_size_bytes=snapshot_block_size_bytes
     )
     eval_data["approx_full_snapshot_size_bytes"] = approx_full_snapshot_size_bytes
@@ -431,6 +422,9 @@ def main(target_snapshot: str, pricing: dict):
         approx_size_target_snapshot_bytes = approx_full_snapshot_size_bytes
         eval_data["approx_size_target_snapshot_bytes"] = approx_size_target_snapshot_bytes
 
+        approx_size_target_snapshot_removed_bytes = approx_size_target_snapshot_bytes
+        eval_data["approx_size_target_snapshot_removed_bytes"] = approx_size_target_snapshot_removed_bytes
+
     if current_eval_scenario == EvalScenario.BOTH:
 
         logger.info(
@@ -469,15 +463,22 @@ def main(target_snapshot: str, pricing: dict):
         for b in changed_blocks_after["ChangedBlocks"]:
             seen_changed_block_index_after.append(b["BlockIndex"])
 
+        # Snapshot size is ANY changed blocks in the before-to-target changed blocks comparison
+        approx_size_target_snapshot_bytes = len(
+            seen_changed_block_index_before) * snapshot_blocks['BlockSize']
+
+        # Not every snapshot would get removed though, so how much would be removed?
         # Using set intersection to find the blocks that are in both comparisons.
+        # This would be the blocks that are deleted if this snapshot was removed.
         block_indexes_in_both_comparisons = set(seen_changed_block_index_before).intersection(
             set(seen_changed_block_index_after))
 
         # Calculate the amount of space that would be saved by moving this snapshot to archive tier
-        approx_size_target_snapshot_bytes = len(
+        approx_size_target_snapshot_removed_bytes = len(
             block_indexes_in_both_comparisons) * snapshot_blocks['BlockSize']
 
         eval_data["approx_size_target_snapshot_bytes"] = approx_size_target_snapshot_bytes
+        eval_data["approx_size_target_snapshot_removed_bytes"] = approx_size_target_snapshot_removed_bytes
 
     if current_eval_scenario == EvalScenario.BEFORE:
         # BEFORE - only the before snapshot exists, none after (i.e. target is most likely the most recent snapshot) - target snap includes 1 set of changed blocks
@@ -495,10 +496,14 @@ def main(target_snapshot: str, pricing: dict):
         logger.info(
             'Step 7 - Changed block delta contains the unreferenced (changed) data in target snapshot...')
 
+        # Snapshot size is ANY changed blocks in the before-to-target changed blocks comparison
         approx_size_target_snapshot_bytes = len(
             changed_blocks_before["ChangedBlocks"]) * snapshot_blocks['BlockSize']
 
+        approx_size_target_snapshot_removed_bytes = approx_size_target_snapshot_bytes
+
         eval_data["approx_size_target_snapshot_bytes"] = approx_size_target_snapshot_bytes
+        eval_data["approx_size_target_snapshot_removed_bytes"] = approx_size_target_snapshot_removed_bytes
 
     if current_eval_scenario == EvalScenario.AFTER:
         # No prior snapshots = target snapshot does not reference blocks. Has everything.
@@ -516,12 +521,17 @@ def main(target_snapshot: str, pricing: dict):
 
         logger.info(
             'Step 7 - Changed block delta contains amount of blocks that would be no longer referenced in target snapshot...')
-        # Expected savings = any block indexes that have changed (and thus aren't referenced)
 
+        # Snapshot size is ALL blocks in the snapshot
         approx_size_target_snapshot_bytes = len(
+            snapshot_blocks['Blocks']) * snapshot_blocks['BlockSize']
+
+        # Expected savings = any block indexes that have changed (and thus aren't referenced in other snapshots)
+        approx_size_target_snapshot_removed_bytes = len(
             changed_blocks_after["ChangedBlocks"]) * snapshot_blocks['BlockSize']
 
         eval_data["approx_size_target_snapshot_bytes"] = approx_size_target_snapshot_bytes
+        eval_data["approx_size_target_snapshot_removed_bytes"] = approx_size_target_snapshot_removed_bytes
 
     logger.info('Step 8 - Determining storage costs for this snapshot...')
 
