@@ -34,6 +34,7 @@ def lambda_handler(event, context):
         'snapshot_before',
         'snapshot_after',
         'approx_size_target_snapshot_bytes',
+        'approx_size_target_snapshot_removed_bytes',
         'cost_estimate_90days_target_snapshot_in_std_tier',
         'cost_estimate_90days_target_snapshot_in_archive_tier'
     ]
