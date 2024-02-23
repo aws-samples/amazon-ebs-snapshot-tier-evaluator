@@ -185,7 +185,6 @@ def lambda_handler(event, context):
     table = dynamodb.Table(snapshot_job_tracking_table)
     table.put_item(Item={
         "SnapshotJobId": jobid,
-        "Snapshots": snapshot_ids,
         "DateStarted": str(datetime.now()),
     })
 
