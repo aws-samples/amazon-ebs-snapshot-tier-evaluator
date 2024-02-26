@@ -253,17 +253,9 @@ export class EBSSnapshotEvalStack extends cdk.Stack {
       }
     );
 
-    const SECONDS_TO_WAIT_BEFORE_STATUS_CHECK = 60;
-
-    const waitState = new sfn.Wait(
-      this,
-      `Wait ${SECONDS_TO_WAIT_BEFORE_STATUS_CHECK} seconds`,
-      {
-        time: sfn.WaitTime.duration(
-          cdk.Duration.seconds(SECONDS_TO_WAIT_BEFORE_STATUS_CHECK)
-        ),
-      }
-    );
+    const waitState = new sfn.Wait(this, `Wait before checking status`, {
+      time: sfn.WaitTime.secondsPath("$.waitSeconds"),
+    });
 
     const consolidateResultsTask = new tasks.LambdaInvoke(
       this,

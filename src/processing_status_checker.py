@@ -42,11 +42,13 @@ def lambda_handler(event, context):
         return {
             "jobid": event['jobid'],
             "num_jobs_pending": num_jobs_pending,
+            "waitSeconds": event['waitSeconds'],
             "completed": "false"
         }
     else:
         print("Processing complete")
         return {
             "jobid": event['jobid'],
+            "waitSeconds": event['waitSeconds'],
             "completed": "true"
         }

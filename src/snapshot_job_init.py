@@ -215,6 +215,19 @@ def lambda_handler(event, context):
             MessageBody=json.dumps(message, cls=DecimalEncoder)
         )
 
+    wait_in_seconds = 900    # 15 minutes
+    number_of_snapshots = len(snapshot_ids)
+    if number_of_snapshots < 1000:
+        wait_in_seconds = 60
+    elif number_of_snapshots < 5000:
+        wait_in_seconds = 120
+    elif number_of_snapshots < 10000:
+        wait_in_seconds = 300
+    elif number_of_snapshots < 20000:
+        wait_in_seconds = 600
+
     return {
-        "jobid": jobid
+        "jobid": jobid,
+        "number_of_snapshots": number_of_snapshots,
+        "waitSeconds": wait_in_seconds
     }
